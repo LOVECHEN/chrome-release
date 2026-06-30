@@ -48,14 +48,22 @@ Chrome for Testing 是 Google 官方专为自动化/测试发布的分发渠道�
 - `stable-146.0.7680.76` — Stable 正式版
 - `beta-147.0.7727.3` — Beta 测试版
 - `dev-148.0.7730.2` — Dev 开发版
+- `canary-151.0.7920.0` — Canary 金丝雀版
+
+> Canary 的 Release 一次包含两个文件：官方 `chrome-canary-mac.dmg`（mac universal）与 Chrome for Testing 的 `chrome-canary-cft-mac-arm64.zip`（mac Apple Silicon，版本钉死不更新）。tag 版本号以官方 mac Canary 为准。
 
 ## 自动化
 
 GitHub Actions 每日 UTC 06:00（北京时间 14:00）自动执行：
 
-1. 查询 [Google VersionHistory API](https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases) 获取最新版本号
+- **stable / beta / dev**：下载全平台离线安装包（msi/dmg/deb/rpm），tag `<channel>-<version>`
+- **canary**（独立 job）：官方 Canary mac dmg + Chrome for Testing mac-arm64 zip，tag `canary-<version>`
+
+流程：
+
+1. 查询 [Google VersionHistory API](https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases) 获取最新版本号（canary 用 mac 平台、并额外查 CfT JSON）
 2. 对比已有 Release，版本未变则跳过
-3. 下载全平台离线安装包
+3. 下载安装包
 4. 生成 SHA256 校验文件
 5. 创建 GitHub Release 并上传
 

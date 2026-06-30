@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: 'Channel to download (stable/beta/dev/all)'
+        description: 'Channel to download (stable/beta/dev/canary/all)'
         required: false
         default: 'all'
 
@@ -234,6 +234,210 @@ jobs:
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Chrome ${CH_NAME} ${VERSION}" \
+            --notes-file "$NOTES_FILE" \
+            "$DIR"/*
+
+          echo "✅ Release created: ${TAG}"
+
+  # Canary 单独成 job：官方 Canary 仅 mac dmg（无 win/linux 离线包），
+  # 额外附带 Chrome for Testing 的 mac-arm64 zip（版本钉死、不自动更新）。
+  # 不并入上面的 matrix（那里的 URL case 只有 stable/beta/dev）。
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Filter channel
+        id: filter
+        run: |
+          INPUT_CHANNEL="${{ github.event.inputs.channel || 'all' }}"
+          if [[ "$INPUT_CHANNEL" != "all" && "$INPUT_CHANNEL" != "canary" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "⏭ Skipping canary (requested: $INPUT_CHANNEL)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Query official Canary version (mac)
+        if: steps.filter.outputs.skip != 'true'
+        id: version
+        run: |
+          # 官方 Canary 仅 macOS 有离线 DMG，故用 mac 作为版本基准
+          API_URL="https://versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/canary/versions/all/releases?filter=endtime=none&order_by=version%20desc"
+
+          echo "📡 Querying official canary (mac) version..."
+          RESPONSE=$(curl -sf "$API_URL")
+          if [ -z "$RESPONSE" ]; then
+            echo "❌ Failed to query version API"
+            exit 1
+          fi
+
+          VERSION=$(echo "$RESPONSE" | jq -r '
+            [.releases[] | select(.fraction >= 1 and .pinnable)] | first // .releases[0]
+            | .version')
+          DATE=$(echo "$RESPONSE" | jq -r '
+            [.releases[] | select(.fraction >= 1 and .pinnable)] | first // .releases[0]
+            | .serving.startTime | split("T")[0]')
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "❌ No version found for canary"
+            exit 1
+          fi
+
+          TAG="canary-${VERSION}"
+          echo "✅ canary: ${VERSION} (${DATE})"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Query Chrome for Testing Canary (mac-arm64)
+        if: steps.filter.outputs.skip != 'true'
+        id: cft
+        run: |
+          echo "📡 Querying Chrome for Testing canary..."
+          CFT_JSON=$(curl -sf "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json")
+          if [ -z "$CFT_JSON" ]; then
+            echo "❌ Failed to query CfT API"
+            exit 1
+          fi
+
+          CFT_VERSION=$(echo "$CFT_JSON" | jq -r '.channels.Canary.version')
+          CFT_URL=$(echo "$CFT_JSON" | jq -r '
+            .channels.Canary.downloads.chrome[] | select(.platform=="mac-arm64") | .url')
+
+          if [ -z "$CFT_URL" ] || [ "$CFT_URL" = "null" ]; then
+            echo "❌ No CfT canary mac-arm64 url found"
+            exit 1
+          fi
+
+          echo "✅ CfT canary: ${CFT_VERSION}"
+          echo "   URL: ${CFT_URL}"
+          echo "cft_version=${CFT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "cft_url=${CFT_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release exists
+        if: steps.filter.outputs.skip != 'true'
+        id: check
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "⏭ Release ${TAG} already exists, skipping"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "🆕 New version: ${TAG}"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download (官方 dmg + CfT zip)
+        if: steps.filter.outputs.skip != 'true' && steps.check.outputs.exists != 'true'
+        id: download
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          DIR="release-${TAG}"
+          mkdir -p "$DIR"
+
+          FAILED=0
+
+          # 1) 官方 Canary mac universal DMG
+          echo ""
+          echo "📥 Downloading 官方 Canary (mac dmg)..."
+          if curl -fL --retry 3 --retry-delay 5 \
+              -o "$DIR/chrome-canary-mac.dmg" \
+              "https://dl.google.com/chrome/mac/universal/canary/googlechromecanary.dmg"; then
+            SIZE=$(stat -c%s "$DIR/chrome-canary-mac.dmg" 2>/dev/null || stat -f%z "$DIR/chrome-canary-mac.dmg" 2>/dev/null)
+            echo "   ✅ chrome-canary-mac.dmg ($((SIZE / 1048576)) MB)"
+          else
+            echo "   ❌ Failed to download 官方 Canary dmg"
+            rm -f "$DIR/chrome-canary-mac.dmg"
+            FAILED=$((FAILED + 1))
+          fi
+
+          # 2) Chrome for Testing Canary mac-arm64 ZIP
+          echo ""
+          echo "📥 Downloading CfT Canary (mac-arm64 zip)..."
+          if curl -fL --retry 3 --retry-delay 5 \
+              -o "$DIR/chrome-canary-cft-mac-arm64.zip" \
+              "${{ steps.cft.outputs.cft_url }}"; then
+            SIZE=$(stat -c%s "$DIR/chrome-canary-cft-mac-arm64.zip" 2>/dev/null || stat -f%z "$DIR/chrome-canary-cft-mac-arm64.zip" 2>/dev/null)
+            echo "   ✅ chrome-canary-cft-mac-arm64.zip ($((SIZE / 1048576)) MB)"
+          else
+            echo "   ❌ Failed to download CfT Canary zip"
+            rm -f "$DIR/chrome-canary-cft-mac-arm64.zip"
+            FAILED=$((FAILED + 1))
+          fi
+
+          if [ "$FAILED" -eq 2 ]; then
+            echo "❌ All downloads failed"
+            exit 1
+          fi
+
+          echo ""
+          echo "dir=${DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate checksums
+        if: steps.filter.outputs.skip != 'true' && steps.check.outputs.exists != 'true'
+        run: |
+          DIR="${{ steps.download.outputs.dir }}"
+          cd "$DIR"
+          sha256sum * > checksums.sha256
+          echo "📋 Checksums:"
+          cat checksums.sha256
+
+      - name: Create GitHub Release
+        if: steps.filter.outputs.skip != 'true' && steps.check.outputs.exists != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DATE="${{ steps.version.outputs.date }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          CFT_VERSION="${{ steps.cft.outputs.cft_version }}"
+          DIR="${{ steps.download.outputs.dir }}"
+
+          NOTES_FILE="release-notes.md"
+          {
+            echo "## Chrome 金丝雀版 (Canary) ${VERSION}"
+            echo ""
+            echo "📅 发布日期: ${DATE}"
+            echo "🔖 渠道: 金丝雀版 (Canary)"
+            echo ""
+            echo "### 下载文件"
+            echo ""
+            printf "| 来源 | 平台 | 文件 |\n"
+            printf "|------|------|------|\n"
+          } > "$NOTES_FILE"
+
+          for f in "$DIR"/chrome-*; do
+            FNAME=$(basename "$f")
+            SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+            SIZE_MB=$((SIZE / 1048576))
+
+            case "$FNAME" in
+              *cft-mac-arm64*) SRC="Chrome for Testing"; PLAT="macOS Apple Silicon (arm64)" ;;
+              *canary-mac.dmg) SRC="官方 (Google Chrome Canary)"; PLAT="macOS (Universal)" ;;
+              *) SRC="Other"; PLAT="Other" ;;
+            esac
+
+            printf "| %s | %s | \`%s\` (%d MB) |\n" "$SRC" "$PLAT" "$FNAME" "$SIZE_MB" >> "$NOTES_FILE"
+          done
+
+          {
+            echo ""
+            echo "> ℹ️ 官方 Canary 仅 macOS 提供 universal 离线 DMG（自动更新，需自行屏蔽）。"
+            echo "> Chrome for Testing 版本 \`${CFT_VERSION}\`，版本钉死、不自动更新，产物为「Google Chrome for Testing.app」。"
+            echo ""
+            echo "### SHA256 校验"
+            echo '```'
+            cat "${DIR}/checksums.sha256"
+            echo '```'
+            echo ""
+            echo "---"
+            echo "> 🤖 自动构建于 $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "> 📡 数据源: [VersionHistory API](https://versionhistory.googleapis.com) + [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)"
+          } >> "$NOTES_FILE"
+
+          echo "📦 Creating release: ${TAG}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Chrome 金丝雀版 (Canary) ${VERSION}" \
             --notes-file "$NOTES_FILE" \
             "$DIR"/*
 
