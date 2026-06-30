@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +90,7 @@ var channels = []Channel{
 	{ID: "stable", Name: "正式版 (Stable)"},
 	{ID: "beta", Name: "测试版 (Beta)"},
 	{ID: "dev", Name: "开发版 (Dev)"},
+	{ID: "canary", Name: "金丝雀版 (Canary)"},
 }
 
 // 下载 URL 映射: downloadURLs[channel][platform]
@@ -113,6 +115,11 @@ var downloadURLs = map[string]map[string]string{
 		"mac":       "https://dl.google.com/chrome/mac/universal/dev/googlechromedev.dmg",
 		"linux-deb": "https://dl.google.com/linux/direct/google-chrome-unstable_current_amd64.deb",
 		"linux-rpm": "https://dl.google.com/linux/direct/google-chrome-unstable_current_x86_64.rpm",
+	},
+	"canary": {
+		// Canary 仅 macOS 提供 universal 离线 DMG。
+		// Windows Canary 只有在线 stub 安装器（无 standalone enterprise MSI），Linux 无 Canary 渠道。
+		"mac": "https://dl.google.com/chrome/mac/universal/canary/googlechromecanary.dmg",
 	},
 }
 
@@ -323,19 +330,286 @@ func getRemoteSize(client *http.Client, url string) int64 {
 	return resp.ContentLength
 }
 
+// ─────────────────── Chrome for Testing ───────────────────
+//
+// CfT 是独立分发渠道（专为自动化测试），与官方消费版完全不同：
+//   - 版本与下载地址都由一个 JSON 端点直接给出，无需 versionhistory API、无需硬编码 URL
+//   - 产物是 .zip（非 DMG/MSI），且 mac 按架构拆分（mac-arm64 / mac-x64），没有 universal
+//   - 内置「不自动更新」，天然适合做版本钉死的便携 Chrome
+//   - 四个渠道齐全：Stable / Beta / Dev / Canary
+
+const cftAPIURL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+
+// CfT 平台命名与官方源不同：按架构区分，无 universal
+var cftPlatforms = []Platform{
+	{ID: "mac-arm64", Name: "macOS (Apple Silicon)"},
+	{ID: "mac-x64", Name: "macOS (Intel)"},
+	{ID: "linux64", Name: "Linux 64-bit"},
+	{ID: "win64", Name: "Windows 64-bit"},
+	{ID: "win32", Name: "Windows 32-bit"},
+}
+
+var cftChannels = []Channel{
+	{ID: "stable", Name: "正式版 (Stable)"},
+	{ID: "beta", Name: "测试版 (Beta)"},
+	{ID: "dev", Name: "开发版 (Dev)"},
+	{ID: "canary", Name: "金丝雀版 (Canary)"},
+}
+
+type cftDownload struct {
+	Platform string `json:"platform"`
+	URL      string `json:"url"`
+}
+
+type cftChannelInfo struct {
+	Channel   string `json:"channel"`
+	Version   string `json:"version"`
+	Revision  string `json:"revision"`
+	Downloads struct {
+		Chrome []cftDownload `json:"chrome"`
+	} `json:"downloads"`
+}
+
+type cftResponse struct {
+	Timestamp string                    `json:"timestamp"`
+	Channels  map[string]cftChannelInfo `json:"channels"`
+}
+
+func fetchCfT() (*cftResponse, error) {
+	resp, err := httpClient.Get(cftAPIURL)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var cr cftResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %w", err)
+	}
+	return &cr, nil
+}
+
+// 渠道 ID（stable）→ CfT JSON 中的键（Stable）
+func cftChannelKey(id string) string {
+	if id == "" {
+		return ""
+	}
+	return strings.ToUpper(id[:1]) + id[1:]
+}
+
+func filterCfTPlatforms(id string) []Platform {
+	if id == "all" {
+		return cftPlatforms
+	}
+	// 未显式指定平台时（main 默认传 "mac"）→ 按主机架构挑选 mac 包
+	if id == "mac" || id == "" {
+		if runtime.GOARCH == "amd64" {
+			id = "mac-x64"
+		} else {
+			id = "mac-arm64"
+		}
+	}
+	for _, p := range cftPlatforms {
+		if p.ID == id {
+			return []Platform{p}
+		}
+	}
+	return nil
+}
+
+func filterCfTChannels(id string) []Channel {
+	if id == "all" {
+		return cftChannels
+	}
+	for _, c := range cftChannels {
+		if c.ID == id {
+			return []Channel{c}
+		}
+	}
+	return nil
+}
+
+// CfT 下载主流程
+func runCfT(platformArg, channelFlag, output string, workers int, infoOnly bool) {
+	selectedPlatforms := filterCfTPlatforms(platformArg)
+	selectedChannels := filterCfTChannels(channelFlag)
+	if len(selectedPlatforms) == 0 {
+		fatal("未知 CfT 平台: %s\n可选: mac-arm64, mac-x64, linux64, win64, win32, all", platformArg)
+	}
+	if len(selectedChannels) == 0 {
+		fatal("未知渠道: %s\n可选: stable, beta, dev, canary, all", channelFlag)
+	}
+
+	fmt.Println()
+	fmt.Println(cCyan + cBold + "╔══════════════════════════════════════════════╗" + cReset)
+	fmt.Println(cCyan + cBold + "║    Chrome for Testing Downloader             ║" + cReset)
+	fmt.Println(cCyan + cBold + "╚══════════════════════════════════════════════╝" + cReset)
+	fmt.Println()
+
+	fmt.Println(cDim + "⏳ 正在查询 Chrome for Testing 版本..." + cReset)
+	cr, err := fetchCfT()
+	if err != nil {
+		fatal("查询 CfT 失败: %v", err)
+	}
+	fmt.Println()
+
+	// 在某渠道下查指定平台的版本与 URL
+	lookup := func(chID, pID string) (version, url string, ok bool) {
+		info, found := cr.Channels[cftChannelKey(chID)]
+		if !found {
+			return "", "", false
+		}
+		for _, d := range info.Downloads.Chrome {
+			if d.Platform == pID {
+				return info.Version, d.URL, true
+			}
+		}
+		return info.Version, "", false
+	}
+
+	// 版本表（CfT 同渠道各平台版本一致，按渠道打印即可）
+	fmt.Printf("  %-22s%s\n", "渠道", "版本")
+	fmt.Printf("  %-22s%s\n", strings.Repeat("─", 20), strings.Repeat("─", 18))
+	for _, ch := range selectedChannels {
+		if info, found := cr.Channels[cftChannelKey(ch.ID)]; found {
+			fmt.Printf("  %-22s%s\n", ch.Name, info.Version)
+		} else {
+			fmt.Printf("  %-22s%s\n", ch.Name, cDim+"—"+cReset)
+		}
+	}
+	fmt.Println()
+
+	if infoOnly {
+		return
+	}
+
+	var tasks []downloadTask
+	for _, ch := range selectedChannels {
+		for _, p := range selectedPlatforms {
+			ver, url, ok := lookup(ch.ID, p.ID)
+			if !ok || url == "" {
+				continue
+			}
+			filename := fmt.Sprintf("chrome-cft-%s-%s.zip", ch.ID, p.ID)
+			dirName := fmt.Sprintf("cft-%s-%s", ch.ID, ver)
+			dest := filepath.Join(output, dirName, filename)
+			label := fmt.Sprintf("[cft/%s/%s]", ch.ID, p.ID)
+			tasks = append(tasks, downloadTask{
+				channel:  "cft-" + ch.ID,
+				platform: p.ID,
+				version:  ver,
+				url:      url,
+				dest:     dest,
+				label:    label,
+			})
+		}
+	}
+	if len(tasks) == 0 {
+		fatal("无可下载的目标")
+	}
+	runDownloads(tasks, workers, output)
+}
+
+// ─────────────────── 下载任务执行器 ───────────────────
+
+type downloadTask struct {
+	channel  string
+	platform string
+	version  string
+	url      string
+	dest     string
+	label    string
+}
+
+// runDownloads 并发执行一组下载任务并打印摘要（官方源与 CfT 源共用）
+func runDownloads(tasks []downloadTask, workers int, output string) {
+	fmt.Printf(cBold+"📦 共 %d 个下载任务，并发数 %d\n\n"+cReset, len(tasks), workers)
+
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var successCount, failCount atomic.Int32
+	results := make([]DownloadResult, len(tasks))
+
+	for i, t := range tasks {
+		wg.Add(1)
+		go func(idx int, t downloadTask) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			fmt.Fprintf(os.Stderr, cCyan+"▶ 开始下载 %s %s\n"+cReset, t.label, t.version)
+			size, err := downloadFile(t.url, t.dest, t.label)
+			if err != nil {
+				failCount.Add(1)
+				fmt.Fprintf(os.Stderr, cRed+"   ✗ %s 失败: %v\n"+cReset, t.label, err)
+			} else {
+				successCount.Add(1)
+				fmt.Fprintf(os.Stderr, cGreen+"   ✓ %s 完成\n"+cReset, t.label)
+			}
+			results[idx] = DownloadResult{
+				Platform: t.platform,
+				Channel:  t.channel,
+				Version:  t.version,
+				Filename: t.dest,
+				Size:     size,
+				Err:      err,
+			}
+		}(i, t)
+	}
+	wg.Wait()
+
+	// 摘要
+	fmt.Println()
+	fmt.Println(cBold + "═══════════════════ 下载摘要 ═══════════════════" + cReset)
+	fmt.Println()
+
+	var totalSize int64
+	for _, r := range results {
+		status := cGreen + "✓" + cReset
+		sizeStr := humanSize(r.Size)
+		if r.Err != nil {
+			status = cRed + "✗" + cReset
+			sizeStr = r.Err.Error()
+		} else {
+			totalSize += r.Size
+		}
+		fmt.Printf("  %s  %-12s %-12s %-20s %s\n",
+			status, r.Channel, r.Platform, r.Version, sizeStr)
+	}
+
+	fmt.Println()
+	s := successCount.Load()
+	f := failCount.Load()
+	fmt.Printf("  成功: %s%d%s  失败: %s%d%s  总大小: %s\n",
+		cGreen, s, cReset,
+		cRed, f, cReset,
+		humanSize(totalSize))
+	fmt.Printf("  输出目录: %s\n\n", output)
+}
+
 // ─────────────────── CLI 主逻辑 ───────────────────
 
 func main() {
-	channelFlag := flag.String("channel", "all", "渠道: stable, beta, dev, all")
+	channelFlag := flag.String("channel", "all", "渠道: stable, beta, dev, canary, all")
 	outputFlag := flag.String("output", "./downloads", "下载目录")
 	infoFlag := flag.Bool("info", false, "仅显示版本信息，不下载")
+	cftFlag := flag.Bool("cft", false, "数据源切换为 Chrome for Testing（ZIP 包，按架构区分，自带不更新）")
 	workersFlag := flag.Int("workers", 3, "并发下载数")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: chrome-downloader [选项] [平台|命令]\n\n")
-		fmt.Fprintf(os.Stderr, "平台: win64, win32, mac, linux-deb, linux-rpm, all (默认: mac)\n\n")
+		fmt.Fprintf(os.Stderr, "官方源平台:      win64, win32, mac, linux-deb, linux-rpm, all (默认: mac)\n")
+		fmt.Fprintf(os.Stderr, "CfT 源平台(-cft): mac-arm64, mac-x64, linux64, win64, win32, all (默认: 主机架构 mac)\n\n")
+		fmt.Fprintf(os.Stderr, "渠道: stable, beta, dev, canary, all\n")
+		fmt.Fprintf(os.Stderr, "  注：官方 Canary 仅 macOS 有离线 DMG；CfT 四渠道全平台齐全\n\n")
 		fmt.Fprintf(os.Stderr, "命令:\n")
-		fmt.Fprintf(os.Stderr, "  clean   清除下载目录中所有非 .dmg 文件\n")
+		fmt.Fprintf(os.Stderr, "  clean   清除下载目录中所有非 .dmg/.zip 文件\n")
 		fmt.Fprintf(os.Stderr, "  help    显示帮助\n\n")
+		fmt.Fprintf(os.Stderr, "示例:\n")
+		fmt.Fprintf(os.Stderr, "  chrome-downloader -channel canary mac        # 官方 Canary (mac dmg)\n")
+		fmt.Fprintf(os.Stderr, "  chrome-downloader -cft -channel canary       # CfT Canary (主机架构 zip)\n")
+		fmt.Fprintf(os.Stderr, "  chrome-downloader -cft -channel all all      # CfT 全渠道全平台\n\n")
 		fmt.Fprintf(os.Stderr, "选项:\n")
 		flag.PrintDefaults()
 	}
@@ -354,6 +628,12 @@ func main() {
 	case "clean":
 		cleanDownloads(*outputFlag)
 		os.Exit(0)
+	}
+
+	// Chrome for Testing 走独立数据源与下载逻辑
+	if *cftFlag {
+		runCfT(platformArg, *channelFlag, *outputFlag, *workersFlag, *infoFlag)
+		return
 	}
 
 	// 解析选择
@@ -391,16 +671,7 @@ func main() {
 	}
 
 	// 构建下载任务
-	type task struct {
-		channel  Channel
-		platform Platform
-		version  string
-		url      string
-		dest     string
-		label    string
-	}
-
-	var tasks []task
+	var tasks []downloadTask
 	for _, ch := range selectedChannels {
 		chVersions, ok := versions[ch.ID]
 		if !ok {
@@ -413,6 +684,7 @@ func main() {
 			}
 			url, ok := downloadURLs[ch.ID][p.ID]
 			if !ok {
+				// 该渠道在此平台无离线包（如 Canary 仅 mac），跳过
 				continue
 			}
 			// 确定文件名和路径
@@ -422,9 +694,9 @@ func main() {
 			dest := filepath.Join(*outputFlag, dirName, filename)
 			label := fmt.Sprintf("[%s/%s]", ch.ID, p.ID)
 
-			tasks = append(tasks, task{
-				channel:  ch,
-				platform: p,
+			tasks = append(tasks, downloadTask{
+				channel:  ch.ID,
+				platform: p.ID,
 				version:  vi.Version,
 				url:      url,
 				dest:     dest,
@@ -437,69 +709,7 @@ func main() {
 		fatal("无可下载的目标")
 	}
 
-	fmt.Printf(cBold+"📦 共 %d 个下载任务，并发数 %d\n\n"+cReset, len(tasks), *workersFlag)
-
-	// 并发下载
-	sem := make(chan struct{}, *workersFlag)
-	var wg sync.WaitGroup
-	var successCount, failCount atomic.Int32
-	results := make([]DownloadResult, len(tasks))
-
-	for i, t := range tasks {
-		wg.Add(1)
-		go func(idx int, t task) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			fmt.Fprintf(os.Stderr, cCyan+"▶ 开始下载 %s %s\n"+cReset, t.label, t.version)
-			size, err := downloadFile(t.url, t.dest, t.label)
-			if err != nil {
-				failCount.Add(1)
-				fmt.Fprintf(os.Stderr, cRed+"   ✗ %s 失败: %v\n"+cReset, t.label, err)
-			} else {
-				successCount.Add(1)
-				fmt.Fprintf(os.Stderr, cGreen+"   ✓ %s 完成\n"+cReset, t.label)
-			}
-			results[idx] = DownloadResult{
-				Platform: t.platform.ID,
-				Channel:  t.channel.ID,
-				Version:  t.version,
-				Filename: t.dest,
-				Size:     size,
-				Err:      err,
-			}
-		}(i, t)
-	}
-	wg.Wait()
-
-	// 打印摘要
-	fmt.Println()
-	fmt.Println(cBold + "═══════════════════ 下载摘要 ═══════════════════" + cReset)
-	fmt.Println()
-
-	var totalSize int64
-	for _, r := range results {
-		status := cGreen + "✓" + cReset
-		sizeStr := humanSize(r.Size)
-		if r.Err != nil {
-			status = cRed + "✗" + cReset
-			sizeStr = r.Err.Error()
-		} else {
-			totalSize += r.Size
-		}
-		fmt.Printf("  %s  %-8s %-10s %-20s %s\n",
-			status, r.Channel, r.Platform, r.Version, sizeStr)
-	}
-
-	fmt.Println()
-	s := successCount.Load()
-	f := failCount.Load()
-	fmt.Printf("  成功: %s%d%s  失败: %s%d%s  总大小: %s\n",
-		cGreen, s, cReset,
-		cRed, f, cReset,
-		humanSize(totalSize))
-	fmt.Printf("  输出目录: %s\n\n", *outputFlag)
+	runDownloads(tasks, *workersFlag, *outputFlag)
 }
 
 // ─────────────────── 辅助函数 ───────────────────
@@ -563,7 +773,7 @@ func fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
-// cleanDownloads 清除下载目录中所有非 .dmg 文件
+// cleanDownloads 清除下载目录中所有非 .dmg/.zip 文件（保留官方 DMG 与 CfT ZIP 安装产物）
 func cleanDownloads(dir string) {
 	var removed []string
 	var totalSize int64
@@ -576,7 +786,7 @@ func cleanDownloads(dir string) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".dmg" {
+		if ext != ".dmg" && ext != ".zip" {
 			size := info.Size()
 			if err := os.Remove(path); err != nil {
 				fmt.Fprintf(os.Stderr, cRed+"  ✗ 删除失败: %s (%v)\n"+cReset, path, err)
