@@ -8,11 +8,13 @@
 [![最近更新](https://img.shields.io/github/release-date/LOVECHEN/chrome-release?label=最近更新&color=4285f4)](https://github.com/LOVECHEN/chrome-release/releases)
 [![自动同步](https://github.com/LOVECHEN/chrome-release/actions/workflows/daily-download.yml/badge.svg)](https://github.com/LOVECHEN/chrome-release/actions/workflows/daily-download.yml)
 
-[**⬇️ 下载最新正式版**](#️-最新下载) · [📦 全部版本](https://github.com/LOVECHEN/chrome-release/releases) · [🤔 版本号为何和别处不同](#-为什么这里的版本号可能比别处低)
+[**⬇️ 下载最新正式版**](#download) · [📦 全部版本](https://github.com/LOVECHEN/chrome-release/releases) · [🤔 版本号为何和别处不同](#why)
 
 </div>
 
 ---
+
+<a id="download"></a>
 
 ## ⬇️ 最新下载
 
@@ -37,6 +39,8 @@ Beta / Dev / Canary 的版本号实时如下，点 badge 进对应下载：
 [![Canary](https://img.shields.io/github/v/release/LOVECHEN/chrome-release?filter=canary-*&label=Canary%20金丝雀&color=ea4335&logo=googlechrome&logoColor=white)](https://github.com/LOVECHEN/chrome-release/releases?q=canary)
 
 ---
+
+<a id="why"></a>
 
 ## 🤔 为什么这里的版本号可能比别处低？
 
