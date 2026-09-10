@@ -3,7 +3,7 @@ name: Daily Chrome Download
 
 on:
   schedule:
-    - cron: '0 6 * * *' # UTC 06:00 = 北京 14:00
+    - cron: '0 */6 * * *' # 每 6 小时 (UTC 0/6/12/18 = 北京 8/14/20/2)，尽快追上新全量版
   workflow_dispatch:
     inputs:
       channel:
@@ -230,11 +230,16 @@ jobs:
             echo "> 📡 数据源: [Google VersionHistory API](https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/${CHANNEL}/versions/all/releases)"
           } >> "$NOTES_FILE"
 
-          echo "📦 Creating release: ${TAG}"
+          # stable 固定标记为仓库 Latest，其余渠道明确 --latest=false：
+          # 保证 releases/latest/download/<asset> 永久直链稳定，不被 canary/dev 抢占
+          if [ "$CHANNEL" = "stable" ]; then LATEST="true"; else LATEST="false"; fi
+
+          echo "📦 Creating release: ${TAG} (latest=${LATEST})"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Chrome ${CH_NAME} ${VERSION}" \
             --notes-file "$NOTES_FILE" \
+            --latest="$LATEST" \
             "$DIR"/*
 
           echo "✅ Release created: ${TAG}"
@@ -439,7 +444,31 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Chrome 金丝雀版 (Canary) ${VERSION}" \
             --notes-file "$NOTES_FILE" \
+            --latest=false \
             "$DIR"/*
 
           echo "✅ Release created: ${TAG}"
+
+  # Keepalive：GitHub 对 public repo 的 schedule workflow，仓库 60 天无提交活动会自动禁用。
+  # 本仓库通常靠频繁的 Release 保持活跃，但极端情况（长期无新版）可能触发。此 job 仅在
+  # 距上次提交 >50 天时推一个空提交兜底，平时零噪音、秒退。
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit if repo near inactivity threshold
+        run: |
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "距上次提交 ${DAYS} 天"
+          if [ "$DAYS" -ge 50 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive — 防 schedule 因 60 天不活跃被禁用"
+            git push
+            echo "✅ 已推空提交保活"
+          else
+            echo "⏭ 无需 keepalive (< 50 天)"
+          fi
 
